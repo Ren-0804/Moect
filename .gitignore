@@ -23,3 +23,5 @@ exports/
 docs/.render/
 docs/images/raw/
 docs/.capture-state/
+
+.tmp/

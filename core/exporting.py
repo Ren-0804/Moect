@@ -202,7 +202,79 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                 resource_summary=resources.stats if resources else {})
 
 
-def export_index(folder, records, demo=False):
+def _listing_page(folder, records, demo=False, failures=None, incomplete=False, total_sessions=None):
+    """Entry point for a multi-session export.
+
+    The per-page session switcher of `export_index` rewrites every HTML file
+    with one <option> per session, which is unusable for hundreds of chats.
+    A searchable landing page keeps a full-library export browsable.
+    """
+    failures=list(failures or [])
+    exported=len(records)
+    messages=sum(int(record.get('count') or 0) for record in records)
+    expected=total_sessions if isinstance(total_sessions,int) and total_sessions>0 else exported+len(failures)
+    formats={str(record.get('format') or '').upper() for record in records if record.get('format')}
+    rows=[]
+    for record in records:
+        try: href=quote(Path(record['path']).relative_to(folder).as_posix(),safe='/')
+        except ValueError: continue
+        name=str(record.get('name') or '')
+        rows.append('<li data-search="%s"><a href="%s">%s</a><span class="count">%s 条</span></li>' % (
+            html.escape(name.casefold(),quote=True),html.escape(href,quote=True),
+            html.escape(name),format(int(record.get('count') or 0),',')))
+    for failure in failures:
+        name=str(failure.get('name') or '')
+        rows.append('<li class="failed" data-search="%s"><span>%s</span>'
+                    '<span class="count">失败 · %s</span></li>' % (
+                        html.escape(name.casefold(),quote=True),html.escape(name),
+                        html.escape(str(failure.get('error') or '未知错误'))))
+    meta=' · '.join([APP_NAME+' · 本地归档','导出于 '+datetime.now().strftime('%Y-%m-%d %H:%M'),
+                     '共 %s 个会话' % format(expected,','),'%s 条消息' % format(messages,',')]
+                    +(['格式 '+' / '.join(sorted(formats))] if formats else [])
+                    +(['演示数据'] if demo else []))
+    notices=''
+    if incomplete:
+        notices+='<p class="warn">本次导出未完成（已完成 %s / %s 个会话），下面是已经保存的部分。</p>' % (
+            format(exported,','),format(expected,','))
+    if failures:
+        notices+='<p class="warn">%s 个会话未能导出，列表中标红显示原因；其余会话已完成。</p>' % format(len(failures),',')
+    body=('\n'.join(rows) or '<li class="empty">没有可显示的会话</li>')
+    script=('const q=document.getElementById("q"),label=document.getElementById("count"),'
+            'rows=[...document.querySelectorAll("#list li")];'
+            'function refresh(){const v=q.value.trim().toLowerCase();let n=0;'
+            'for(const row of rows){const hit=!v||(row.dataset.search||"").includes(v);'
+            'row.hidden=!hit;if(hit)n++;}'
+            'label.textContent="显示 "+n+" / "+rows.length+" 个会话";}'
+            'q.addEventListener("input",refresh);refresh();')
+    content=('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+             '<meta name="viewport" content="width=device-width,initial-scale=1">'
+             '<title>聊天记录归档 · '+html.escape(APP_NAME)+'</title><style>'
+             'body{margin:0;background:#f7f5fb;color:#26212f;font:15px/1.6 "Microsoft YaHei",system-ui,sans-serif}'
+             'header{max-width:1100px;margin:0 auto;padding:44px 32px 20px}h1{margin:0 0 6px;font-size:26px}'
+             '.meta{margin:0;color:#7e718f;font-size:13px}'
+             '.warn{margin:16px 0 0;padding:12px 16px;border-radius:12px;background:#fff4e5;color:#8a5200;font-size:13px}'
+             '.tools{max-width:1100px;margin:0 auto;padding:8px 32px}'
+             'input{width:100%;box-sizing:border-box;padding:11px 18px;border-radius:999px;border:1px solid #e3daef;'
+             'font:inherit;background:#fff;outline:none}input:focus{border-color:#8771cf}'
+             'ul{list-style:none;padding:0;max-width:1100px;margin:14px auto 64px}'
+             'li{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;'
+             'background:#fff;border-radius:14px;margin:8px 32px;box-shadow:0 1px 2px rgba(28,20,45,.05)}'
+             'li a{color:#5b46a8;text-decoration:none;font-weight:600;overflow-wrap:anywhere}'
+             'li a:hover{text-decoration:underline}'
+             '.count{color:#7e718f;font-size:12px;white-space:nowrap}'
+             'li.failed{background:#fff5f5;color:#9b2c2c}li.failed .count{color:#c53030}'
+             '.empty{padding:36px;text-align:center;color:#7e718f}'
+             '</style><header><h1>聊天记录归档</h1><p class="meta">'+meta+'</p>'+notices+
+             '</header><div class="tools"><input id="q" type="search" placeholder="输入名称筛选会话" '
+             'autocomplete="off" aria-label="筛选会话"><p class="meta" id="count"></p></div>'
+             '<ul id="list">'+body+'</ul><script>'+script+'</script></html>')
+    (folder/'index.html').write_text(content,encoding='utf-8')
+
+
+def export_index(folder, records, demo=False, listing=False, failures=None, incomplete=False, total_sessions=None):
+    if listing or not (records and all(r['format']=='html' for r in records)):
+        _listing_page(folder,records,demo,failures,incomplete,total_sessions)
+        return
     # Open HTML archives in the viewer; batch navigation stays inside it.
     if records and all(r['format']=='html' for r in records):
         paths=[Path(r['path']).relative_to(folder).as_posix() for r in records]
@@ -230,9 +302,3 @@ def export_index(folder, records, demo=False):
                  '<a href="'+html.escape(target,quote=True)+'">打开聊天记录</a></html>')
         (folder/'index.html').write_text(content,encoding='utf-8')
         return
-    links = ''.join('<li><a href="%s">%s</a><span>%s 条 · %s</span></li>' %
-                    (html.escape(quote(Path(r['path']).relative_to(folder).as_posix(),safe='/'), quote=True),
-                     html.escape(r['name']), r['count'], r['format'].upper()) for r in records)
-    content = '<!doctype html><meta charset="utf-8"><title>聊天记录归档</title><style>body{font:15px system-ui;max-width:850px;margin:70px auto;background:#f5f7f5;color:#193c32}h1{font-size:32px}li{display:flex;justify-content:space-between;padding:20px;background:white;margin:10px 0;border-radius:12px}a{color:#176b52;text-decoration:none}span{color:#77847e}</style>'
-    content += '<h1>聊天记录归档' + (' · 演示数据' if demo else '') + '</h1><p>'+APP_NAME+' · 本地归档</p><ul>' + links + '</ul>'
-    (folder/'index.html').write_text(content, encoding='utf-8')

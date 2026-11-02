@@ -24,6 +24,22 @@ class Cancelled(Exception):
     pass
 
 
+# The queue used to stop at ten sessions, which made a full library export
+# impossible. Jobs still run one at a time (max_workers=1); these caps only
+# guard against runaway task creation and unbounded history files.
+QUEUE_LIMIT = 200
+TASK_HISTORY = 240
+
+
+def merge_summaries(records):
+    merged = {}
+    for record in records:
+        for key, value in (record.get('resource_summary') or {}).items():
+            if isinstance(value, int):
+                merged[key] = merged.get(key, 0) + value
+    return merged
+
+
 def atomic_json(path, data):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -74,7 +90,18 @@ class Service:
 
     def save(self):
         with self.lock:
-            self.config['tasks'] = self.config['tasks'][-80:]
+            tasks = self.config['tasks']
+            if len(tasks) > TASK_HISTORY:
+                # Drop the oldest finished entries first; queued or running work
+                # must never disappear from the queue while it is still pending.
+                excess = len(tasks) - TASK_HISTORY
+                kept = []
+                for task in tasks:
+                    if excess > 0 and task['status'] not in ('queued', 'running'):
+                        excess -= 1
+                        continue
+                    kept.append(task)
+                self.config['tasks'] = kept
             atomic_json(self.config_path, self.config)
 
     def archive(self, library=None):
@@ -101,13 +128,14 @@ class Service:
 
     @staticmethod
     def public_task(t):
-        result={k:v for k,v in t.items() if k not in ('folder','files')}
+        result={k:v for k,v in t.items() if k not in ('folder','files','session','queued_sessions','cancel_detail')}
         files=t.get('files') or []
         if files:
-            result['title']='、'.join(f['name'] for f in files)
+            if len(files)==1: result['title']=files[0]['name']
             result.setdefault('format',files[0].get('format',''))
             result.setdefault('start_time',files[0].get('start_time'))
             result.setdefault('end_time',files[-1].get('end_time'))
+            if len(files)>1: result['sessions']=len(files)
         return result
 
     def hydrate_profile(self,archive,lib):
@@ -118,8 +146,8 @@ class Service:
 
     def _new_job(self, kind, title):
         with self.lock:
-            if sum(t['status'] in ('queued','running') for t in self.config['tasks']) >= 10:
-                raise ValueError('任务队列已满，请等待当前任务完成。')
+            if sum(t['status'] in ('queued','running') for t in self.config['tasks']) >= QUEUE_LIMIT:
+                raise ValueError('任务队列已满（%d 个待处理任务），请等待当前任务完成。' % QUEUE_LIMIT)
             job = dict(id=uuid.uuid4().hex, kind=kind, title=title, status='queued', progress=0,
                        detail='等待处理', count=0, created_at=datetime.now().strftime('%Y-%m-%d %H:%M'),
                        demo=bool(self.library and self.library.get('demo')))
@@ -143,7 +171,8 @@ class Service:
             fn()
             self._update(job, status='completed', progress=100)
         except Cancelled:
-            self._update(job, status='cancelled', detail='任务已取消，未完成的导出已清理。')
+            self._update(job, status='cancelled',
+                         detail=job.get('cancel_detail') or '任务已取消，未完成的导出已清理。')
         except Exception as exc:
             # Do not return tracebacks, key values or chat content to the UI.
             message = str(exc)
@@ -303,50 +332,126 @@ class Service:
         fmt=payload.get('format','html')
         if fmt not in FORMATS: raise ValueError('不支持此格式')
         library=dict(self.library)
+        requested=[str(user) for user in (payload.get('sessions') or [])]
+        order={user:index for index,user in enumerate(dict.fromkeys(requested))}
+        if not order: raise ValueError('请先选择至少一个会话')
         archive=self.archive(library)
         try:
-            wanted=set(payload.get('sessions') or [])
-            sessions=[s for s in archive.sessions() if s['username'] in wanted]
+            sessions=[s for s in archive.sessions() if s['username'] in order]
         finally: archive.close()
         if not sessions: raise ValueError('请先选择至少一个会话')
-        if len(sessions)>1:
-            with self.lock:
-                if sum(t['status'] in ('queued','running') for t in self.config['tasks'])+len(sessions)>10:
-                    raise ValueError('任务队列最多容纳 10 个会话，请分批导出。')
-            jobs=[self.export(dict(payload,sessions=[s['username']]))['job'] for s in sessions]
-            return {'job':jobs[0],'jobs':jobs}
+        # Keep the order the selection was presented in, so an unattended run
+        # walks the queue exactly as the user saw it, one session at a time.
+        sessions.sort(key=lambda s: order[s['username']])
         options=options_from(payload); options.update(format=fmt,demo=library.get('demo',False))
         output=Path(self.config['export_dir']).resolve()
-        job=self._new_job('export', sessions[0]['display'])
-        job.update(format=fmt,session=sessions[0]['username'],start_time=options.get('start'),end_time=options.get('end'))
+        if len(sessions)==1: return self._export_single(library,sessions[0],options,fmt,output)
+        return self._export_queue(library,sessions,options,fmt,output)
+
+    def _export_single(self, library, session, options, fmt, output):
+        job=self._new_job('export', session['display'])
+        job.update(format=fmt,session=session['username'],start_time=options.get('start'),end_time=options.get('end'))
         job['demo']=library.get('demo',False)
         folder=output/('%s_%s%s' % (datetime.now().strftime('%Y%m%d_%H%M%S'),job['id'][:6], '_演示' if job['demo'] else ''))
         def work():
             staging=output/('.partial_'+job['id'])
             staging.mkdir(parents=True, exist_ok=False)
             archive=self.archive(library)
-            records=[]; total=0
             try:
-                for i, session in enumerate(sessions):
+                def progress(n):
                     self._check(job)
-                    def progress(n):
-                        self._check(job)
-                        self._update(job, count=total+n, progress=int(100*i/len(sessions)),
-                                     detail='正在导出 %s · %s 条' % (session['display'],n))
-                    result=export_session(archive,session,options,staging,self.assets,progress,lambda:self._check(job),
-                        status=lambda message:self._update(job,detail=message))
-                    total+=result['count']; records.append(result)
-                export_index(staging, records, demo=job['demo'])
+                    self._update(job, count=n, detail='正在导出 %s · %s 条' % (session['display'],f'{n:,}'))
+                result=export_session(archive,session,options,staging,self.assets,progress,lambda:self._check(job),
+                    status=lambda message:self._update(job,detail=message))
+                export_index(staging,[result],demo=job['demo'])
                 self._check(job)
                 os.replace(staging,folder)
-                for r in records: r['path']=str(folder/Path(r['path']).relative_to(staging))
-                self._update(job, folder=str(folder), files=records, count=total,
-                             start_time=records[0].get('start_time'),end_time=records[-1].get('end_time'),
-                             resource_summary=records[0].get('resource_summary',{}),
-                             detail='已保存 %d 个会话，共 %s 条消息' % (len(records),f'{total:,}'))
+                result['path']=str(folder/Path(result['path']).relative_to(staging))
+                self._update(job, folder=str(folder), files=[result], count=result['count'],
+                             start_time=result.get('start_time'),end_time=result.get('end_time'),
+                             resource_summary=result.get('resource_summary',{}),
+                             detail='已保存 1 个会话，共 %s 条消息' % f"{result['count']:,}")
             finally:
                 archive.close()
                 if staging.exists(): shutil.rmtree(staging,ignore_errors=True)
+        self.pool.submit(self._run, job, work)
+        return {'job':job['id']}
+
+    def _export_queue(self, library, sessions, options, fmt, output):
+        """One cancellable job that exports the whole selection one by one.
+
+        Each session is written to its own directory inside a single archive
+        folder, so a failure or an interruption keeps everything finished so
+        far and the folder stays browsable through its index page.
+        """
+        total_sessions=len(sessions)
+        job=self._new_job('export', '批量导出 · %d 个会话' % total_sessions)
+        job.update(format=fmt,queued_sessions=total_sessions,session='',
+                   start_time=options.get('start'),end_time=options.get('end'))
+        job['demo']=library.get('demo',False)
+        folder=output/('%s_%s%s' % (datetime.now().strftime('%Y%m%d_%H%M%S'),job['id'][:6], '_演示' if job['demo'] else ''))
+        def work():
+            folder.mkdir(parents=True, exist_ok=True)
+            archive=self.archive(library)
+            records=[]; failures=[]; total=0
+            def snapshot(incomplete=False):
+                try: export_index(folder, records, demo=job['demo'], listing=True, failures=failures,
+                                  incomplete=incomplete, total_sessions=total_sessions)
+                except Exception: pass
+            try:
+                for index, session in enumerate(sessions):
+                    self._check(job)
+                    name=session['display']
+                    self._update(job, progress=int(100*index/total_sessions), count=total,
+                                 detail='第 %d/%d 个 · %s · 正在读取' % (index+1,total_sessions,name))
+                    def progress(n, name=name, position=index):
+                        self._check(job)
+                        self._update(job, count=total+n,
+                                     detail='第 %d/%d 个 · %s · 已读取 %s 条' % (position+1,total_sessions,name,f'{n:,}'))
+                    def status(message, name=name, position=index):
+                        self._update(job, detail='第 %d/%d 个 · %s · %s' % (position+1,total_sessions,name,message))
+                    staging=folder/('.partial_%04d' % index)
+                    shutil.rmtree(staging,ignore_errors=True)
+                    staging.mkdir(parents=True, exist_ok=True)
+                    try:
+                        result=export_session(archive,session,options,staging,self.assets,progress,
+                                              lambda:self._check(job),status=status)
+                        renames={}
+                        for item in list(staging.iterdir()):
+                            target=folder/item.name
+                            if target.exists():
+                                target=folder/('%04d_%s' % (index,item.name))
+                                renames[item.name]=target.name
+                            os.replace(item,target)
+                        relative=Path(result['path']).relative_to(staging)
+                        result['path']=str(folder.joinpath(renames.get(relative.parts[0],relative.parts[0]),
+                                                           *relative.parts[1:]))
+                    except Cancelled:
+                        raise
+                    except Exception as exc:
+                        failures.append({'name':name,'error':str(exc)[:200] or type(exc).__name__})
+                    else:
+                        records.append(result); total+=result['count']
+                    finally:
+                        shutil.rmtree(staging,ignore_errors=True)
+                    if index % 25 == 24: snapshot()
+                self._check(job)
+                summary=merge_summaries(records); summary['failed_sessions']=len(failures)
+                snapshot()
+                self._update(job, folder=str(folder), files=records, count=total,
+                             start_time=records[0].get('start_time') if records else None,
+                             end_time=records[-1].get('end_time') if records else None,
+                             resource_summary=summary,
+                             detail='已保存 %d/%d 个会话，共 %s 条消息%s' % (
+                                 len(records),total_sessions,f'{total:,}',
+                                 ('；%d 个会话失败，详见导出目录的 index.html' % len(failures)) if failures else ''))
+            except BaseException:
+                snapshot(incomplete=True)
+                job['cancel_detail']=('已停止：已完成的 %d 个会话保留在导出目录，其余尚未处理。'
+                                      % len(records))
+                raise
+            finally:
+                archive.close()
         self.pool.submit(self._run, job, work)
         return {'job':job['id']}
 
